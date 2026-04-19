@@ -2,4 +2,8 @@
 name = "plato-prompt-builder"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+description = "Compose LLM prompts from tile search results — PLATO fleet component"
+license = "MIT"
+
+[dependencies]
+# zero external dependencies

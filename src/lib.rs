@@ -1,269 +1,333 @@
-//! plato-prompt-builder — Compose LLM prompts from tile search results
+//! plato-prompt-builder — Compose LLM prompts from tile search results.
 //!
-//! Build context windows from tiles, inject deadband safety, compose system messages.
-//! The invisible layer between "user asks question" and "LLM gets prompt."
-//!
-//! ```rust
-//! let tiles = vec![scored_tile("pyth", "a²+b²=c²", 0.9), ...];
-//! let ctx = build_context(&tiles, 500);
-//! let prompt = build_prompt("What is the theorem?", &tiles, 1000);
-//! ```
+//! This crate is a PLATO fleet component that bridges tile search results and LLM
+//! prompt construction. It handles context budgeting, score-based ranking, deadband
+//! safety injection, and system message formatting — all with zero external dependencies.
 
-/// A scored tile result (input to prompt builder).
+/// A scored tile ready for context injection.
 #[derive(Debug, Clone)]
 pub struct ScoredTile {
-    pub id: String,
     pub question: String,
     pub answer: String,
     pub domain: String,
     pub score: f64,
-    pub confidence: f64,
+    pub use_count: u32,
 }
 
-/// Structured prompt with metadata.
-#[derive(Debug, Clone)]
-pub struct BuiltPrompt {
-    pub system: String,
-    pub context: String,
-    pub user: String,
-    pub total_tokens: usize,
-    pub context_tokens: usize,
-    pub tile_count: usize,
-    pub truncated: bool,
+/// Result of a deadband safety check (mirrors plato-kernel's DeadbandCheck).
+pub struct DeadbandContext {
+    pub passed: bool,
+    pub violations: Vec<String>,
+    pub recommended_channel: Option<String>,
 }
 
-/// Approximate token count (1 token ≈ 4 chars for English).
-pub fn estimate_tokens(text: &str) -> usize {
-    text.len() / 4
+/// Build a full LLM prompt from query and tile context.
+///
+/// Includes a `[PLATO CONTEXT]` section with the context block and a `[QUERY]` section
+/// with the query. Context is truncated to fit within `max_tokens` (approximate: 4 chars
+/// per token). If there are no tiles or the budget is exhausted before any tile fits,
+/// the context block will be empty.
+///
+/// # Format
+/// ```text
+/// [PLATO CONTEXT]
+/// {context block}
+///
+/// [QUERY]
+/// {query}
+/// ```
+pub fn build_prompt(query: &str, tiles: &[ScoredTile], max_tokens: usize) -> String {
+    // Reserve tokens for the fixed structural text:
+    // "[PLATO CONTEXT]\n" (17) + "\n\n[QUERY]\n" (9) + query
+    let structural = "[PLATO CONTEXT]\n\n\n[QUERY]\n";
+    let structural_tokens = structural.len() / 4 + 1; // conservative ceiling
+    let query_tokens = (query.len() + 3) / 4;
+    let context_budget = max_tokens
+        .saturating_sub(structural_tokens)
+        .saturating_sub(query_tokens);
+
+    let context = build_context(tiles, context_budget);
+
+    format!("[PLATO CONTEXT]\n{}\n\n[QUERY]\n{}", context, query)
 }
 
-/// Build context block from scored tiles, respecting token budget.
+/// Build just the context block from tiles.
+///
+/// Tiles are sorted by score descending; tiles are included until the `max_tokens` budget
+/// is exhausted. Each tile is formatted as:
+/// ```text
+/// Q: {question}
+/// A: {answer}
+/// ```
+/// Returns an empty string when the budget is zero or no tiles are provided.
 pub fn build_context(tiles: &[ScoredTile], max_tokens: usize) -> String {
-    if tiles.is_empty() || max_tokens == 0 { return String::new(); }
-    let mut context = String::new();
-    let mut tokens_used = 0;
-    let header = "--- Knowledge Base ---\n";
-    tokens_used += estimate_tokens(header);
-    context.push_str(header);
+    if max_tokens == 0 || tiles.is_empty() {
+        return String::new();
+    }
 
-    for tile in tiles {
-        let entry = format!("[{} ({:.0}%)] Q: {} A: {}\n",
-            tile.domain, tile.confidence * 100.0, tile.question, tile.answer);
-        let entry_tokens = estimate_tokens(&entry);
-        if tokens_used + entry_tokens > max_tokens {
-            context.push_str("[... additional context truncated ...]\n");
-            return context;
+    // Sort tiles by score descending (clone indices to avoid mutating input).
+    let mut sorted: Vec<&ScoredTile> = tiles.iter().collect();
+    sorted.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+
+    let mut context = String::new();
+    let mut chars_used: usize = 0;
+    let max_chars = max_tokens * 4;
+
+    for tile in sorted {
+        let entry = format!("Q: {}\nA: {}\n", tile.question, tile.answer);
+        if chars_used + entry.len() > max_chars {
+            break;
         }
         context.push_str(&entry);
-        tokens_used += entry_tokens;
+        chars_used += entry.len();
     }
+
     context
 }
 
-/// Build a full prompt: system message + context + user query.
-pub fn build_prompt(query: &str, tiles: &[ScoredTile], max_tokens: usize) -> BuiltPrompt {
-    let system = "You are PLATO, a knowledge assistant. Answer questions using the provided context. If the context doesn't contain the answer, say so clearly. Be concise and accurate.".to_string();
-    let mut remaining = max_tokens.saturating_sub(estimate_tokens(&system));
-    remaining = remaining.saturating_sub(estimate_tokens(query));
-
-    let context = build_context(tiles, remaining);
-    let context_tokens = estimate_tokens(&context);
-
-    let mut full = String::new();
-    full.push_str(&system);
-    full.push('\n');
-    full.push_str(&context);
-    full.push_str("User: ");
-    full.push_str(query);
-    full.push('\n');
-    full.push_str("Answer: ");
-
-    let truncated = context.contains("truncated");
-    BuiltPrompt {
-        system, context, user: query.to_string(),
-        total_tokens: estimate_tokens(&full), context_tokens,
-        tile_count: tiles.len(), truncated,
+/// Score and sort tiles by relevance to query.
+///
+/// Score = number of query words that appear (case-insensitive) in `question + answer`
+/// divided by the total number of query words.
+///
+/// If `query` is empty, all tiles are returned in their original order with score `0.0`.
+pub fn rank_for_context<'a>(tiles: &'a [ScoredTile], query: &str) -> Vec<(f64, &'a ScoredTile)> {
+    if query.trim().is_empty() {
+        return tiles.iter().map(|t| (0.0, t)).collect();
     }
+
+    let query_words: Vec<String> = query
+        .split_whitespace()
+        .map(|w| w.to_lowercase())
+        .collect();
+    let query_word_count = query_words.len() as f64;
+
+    let mut scored: Vec<(f64, &ScoredTile)> = tiles
+        .iter()
+        .map(|tile| {
+            let haystack = format!("{} {}", tile.question, tile.answer).to_lowercase();
+            let overlap = query_words
+                .iter()
+                .filter(|w| haystack.contains(w.as_str()))
+                .count() as f64;
+            let score = overlap / query_word_count;
+            (score, tile)
+        })
+        .collect();
+
+    // Sort by score descending; stable so equal scores preserve original order.
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored
 }
 
-/// Build context with per-tile token budget (fair allocation).
-pub fn build_balanced_context(tiles: &[ScoredTile], max_tokens: usize) -> String {
-    if tiles.is_empty() { return String::new(); }
-    let per_tile = max_tokens / tiles.len().max(1);
-    let mut context = String::new();
-    for tile in tiles {
-        let t = tile;
-        context.push_str(&build_context(std::slice::from_ref(t), per_tile));
+/// Prepend safety context to a prompt when a deadband check flagged issues.
+///
+/// If `check.passed` is `true`, the prompt is returned unchanged.
+/// If there are violations, prepends:
+/// ```text
+/// [SAFETY] Violations: {violations joined by ", "}
+///
+/// {prompt}
+/// ```
+pub fn inject_deadband(prompt: &str, check: &DeadbandContext) -> String {
+    if check.passed {
+        return prompt.to_string();
     }
-    context
+    let violations = check.violations.join(", ");
+    format!("[SAFETY] Violations: {}\n\n{}", violations, prompt)
 }
 
-/// Inject deadband safety context before a prompt.
-pub fn inject_deadband(prompt: &str, active_negatives: &[String]) -> String {
-    if active_negatives.is_empty() { return prompt.to_string(); }
-    let mut safety = String::from("SAFETY CONSTRAINTS (do not violate):\n");
-    for neg in active_negatives {
-        safety.push_str(&format!("- NEVER: {}\n", neg));
-    }
-    safety.push('\n');
-    format!("{}{}", safety, prompt)
-}
-
-/// Build a system message for a specific role.
+/// Build a system message for an LLM with role and capabilities.
+///
+/// Format: `"You are {role}. Capabilities: {capabilities joined by ', '}."`
 pub fn build_system_message(role: &str, capabilities: &[&str]) -> String {
-    let mut msg = format!("You are {}, a PLATO knowledge assistant.\n\n", role);
-    msg.push_str("Capabilities:\n");
-    for cap in capabilities {
-        msg.push_str(&format!("- {}\n", cap));
-    }
-    msg.push_str("\nRules:\n");
-    msg.push_str("- Answer from the provided context when possible.\n");
-    msg.push_str("- If context is insufficient, say so clearly.\n");
-    msg.push_str("- Be concise. Be accurate. No hallucination.\n");
-    msg
-}
-
-/// Extract just the relevant answer snippets for a query.
-pub fn extract_relevant_snippets(tiles: &[ScoredTile], max_snippets: usize) -> Vec<String> {
-    tiles.iter().take(max_snippets).map(|t| {
-        format!("[{}] {}", t.domain, t.answer)
-    }).collect()
-}
-
-/// Truncate text to fit token budget, respecting word boundaries.
-pub fn truncate_to_tokens(text: &str, max_tokens: usize) -> String {
-    let max_chars = max_tokens * 4;
-    if text.len() <= max_chars { return text.to_string(); }
-    let truncated = &text[..max_chars];
-    // Find last space to avoid cutting words
-    if let Some(space) = truncated.rfind(' ') {
-        format!("{}...", &truncated[..space])
-    } else {
-        format!("{}...", &truncated[..max_chars])
-    }
+    let caps = capabilities.join(", ");
+    format!("You are {}. Capabilities: {}.", role, caps)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn tile(id: &str, q: &str, a: &str, domain: &str, score: f64) -> ScoredTile {
-        ScoredTile { id: id.to_string(), question: q.to_string(), answer: a.to_string(),
-                     domain: domain.to_string(), score, confidence: 0.9 }
+    fn make_tile(question: &str, answer: &str, domain: &str, score: f64) -> ScoredTile {
+        ScoredTile {
+            question: question.to_string(),
+            answer: answer.to_string(),
+            domain: domain.to_string(),
+            score,
+            use_count: 0,
+        }
+    }
+
+    // --- build_prompt ---
+
+    #[test]
+    fn test_build_prompt_includes_query_and_context() {
+        let tiles = vec![make_tile("What is 2+2?", "4", "math", 0.9)];
+        let prompt = build_prompt("Explain addition", &tiles, 1000);
+        assert!(prompt.contains("[PLATO CONTEXT]"), "missing PLATO CONTEXT header");
+        assert!(prompt.contains("[QUERY]"), "missing QUERY header");
+        assert!(prompt.contains("Explain addition"), "missing query text");
+        assert!(prompt.contains("What is 2+2?"), "missing tile question");
+        assert!(prompt.contains("4"), "missing tile answer");
     }
 
     #[test]
-    fn test_estimate_tokens() {
-        assert_eq!(estimate_tokens("hello world"), 2); // 11 chars / 4 = 2
-        assert_eq!(estimate_tokens(""), 0);
+    fn test_build_prompt_no_tiles() {
+        let prompt = build_prompt("Hello?", &[], 1000);
+        assert!(prompt.contains("[PLATO CONTEXT]"));
+        assert!(prompt.contains("[QUERY]"));
+        assert!(prompt.contains("Hello?"));
+        // context block should be empty — just the headers
+        let ctx_start = prompt.find("[PLATO CONTEXT]\n").unwrap() + "[PLATO CONTEXT]\n".len();
+        let ctx_end = prompt.find("\n\n[QUERY]").unwrap();
+        let context_block = &prompt[ctx_start..ctx_end];
+        assert!(context_block.is_empty(), "expected empty context block, got: {:?}", context_block);
     }
 
     #[test]
-    fn test_build_context_basic() {
+    fn test_build_prompt_truncates_at_max_tokens() {
+        // Each tile answer is 400 chars = 100 tokens.  With budget of 30 tokens we
+        // expect no tile to fit in the context.
+        let tiles: Vec<ScoredTile> = (0..5)
+            .map(|i| make_tile("Q", &"x".repeat(400), &format!("d{}", i), 0.9 - i as f64 * 0.1))
+            .collect();
+        let prompt = build_prompt("small query", &tiles, 30);
+        // context block should be empty because budget is too small
+        let ctx_start = prompt.find("[PLATO CONTEXT]\n").unwrap() + "[PLATO CONTEXT]\n".len();
+        let ctx_end = prompt.find("\n\n[QUERY]").unwrap();
+        let context_block = &prompt[ctx_start..ctx_end];
+        assert!(
+            context_block.is_empty(),
+            "expected context truncated to empty, got {} chars",
+            context_block.len()
+        );
+    }
+
+    // --- build_context ---
+
+    #[test]
+    fn test_build_context_respects_token_budget() {
+        // Each tile entry "Q: Q\nA: XXXX...\n" is well over 100 tokens (400+ chars).
+        let tiles: Vec<ScoredTile> = (0..5)
+            .map(|i| make_tile("Q", &"x".repeat(400), "d", 0.9 - i as f64 * 0.1))
+            .collect();
+        let ctx = build_context(&tiles, 100); // 400 chars
+        // At most one tile (which itself is ~406 chars > 400) should not fit
+        // so the context should be empty.
+        assert!(
+            ctx.is_empty(),
+            "expected empty context for tight budget, got {} chars",
+            ctx.len()
+        );
+    }
+
+    #[test]
+    fn test_build_context_sorts_by_score() {
         let tiles = vec![
-            tile("t1", "What is pi?", "3.14159", "math", 0.9),
+            make_tile("Low scoring question", "low answer", "d", 0.2),
+            make_tile("High scoring question", "high answer", "d", 0.9),
+            make_tile("Mid scoring question", "mid answer", "d", 0.5),
         ];
-        let ctx = build_context(&tiles, 500);
-        assert!(ctx.contains("Knowledge Base"));
-        assert!(ctx.contains("3.14159"));
+        let ctx = build_context(&tiles, 2000);
+        let high_pos = ctx.find("high answer").unwrap();
+        let mid_pos = ctx.find("mid answer").unwrap();
+        let low_pos = ctx.find("low answer").unwrap();
+        assert!(high_pos < mid_pos, "high score tile should appear before mid");
+        assert!(mid_pos < low_pos, "mid score tile should appear before low");
     }
 
     #[test]
-    fn test_build_context_empty() {
-        let ctx = build_context(&[], 500);
-        assert!(ctx.is_empty());
+    fn test_build_context_zero_budget_returns_empty() {
+        let tiles = vec![make_tile("Q", "A", "d", 0.9)];
+        let ctx = build_context(&tiles, 0);
+        assert!(ctx.is_empty(), "zero budget should yield empty context");
     }
 
-    #[test]
-    fn test_build_context_truncation() {
-        let tiles: Vec<ScoredTile> = (0..10).map(|i| {
-            tile(&format!("t{}", i), &format!("Q{}", i), &"x".repeat(200), "math", 0.9)
-        }).collect();
-        let ctx = build_context(&tiles, 50); // very small budget
-        assert!(ctx.contains("truncated"));
-    }
+    // --- rank_for_context ---
 
     #[test]
-    fn test_build_prompt_structure() {
-        let tiles = vec![tile("t1", "Q", "A", "math", 0.9)];
-        let prompt = build_prompt("What?", &tiles, 1000);
-        assert!(prompt.system.contains("PLATO"));
-        assert!(prompt.context.contains("Knowledge Base"));
-        assert!(prompt.user == "What?");
-        assert!(prompt.total_tokens > 0);
-        assert!(!prompt.truncated);
-    }
-
-    #[test]
-    fn test_build_prompt_tile_count() {
-        let tiles = vec![tile("t1", "Q", "A", "m", 0.9), tile("t2", "Q2", "A2", "m", 0.8)];
-        let prompt = build_prompt("q", &tiles, 1000);
-        assert_eq!(prompt.tile_count, 2);
-    }
-
-    #[test]
-    fn test_build_balanced_context() {
-        let tiles = vec![tile("t1", "Q1", "A1", "m", 0.9), tile("t2", "Q2", "A2", "m", 0.8)];
-        let ctx = build_balanced_context(&tiles, 200);
-        assert!(ctx.contains("A1"));
-        assert!(ctx.contains("A2"));
-    }
-
-    #[test]
-    fn test_inject_deadband() {
-        let tiles = vec!["rm -rf".to_string(), "DROP TABLE".to_string()];
-        let prompt = inject_deadband("User: hello", &tiles);
-        assert!(prompt.contains("SAFETY CONSTRAINTS"));
-        assert!(prompt.contains("NEVER: rm -rf"));
-        assert!(prompt.contains("NEVER: DROP TABLE"));
-    }
-
-    #[test]
-    fn test_inject_deadband_empty() {
-        let prompt = inject_deadband("hello", &[]);
-        assert_eq!(prompt, "hello");
-    }
-
-    #[test]
-    fn test_build_system_message() {
-        let msg = build_system_message("MathTutor", &["algebra", "calculus"]);
-        assert!(msg.contains("MathTutor"));
-        assert!(msg.contains("algebra"));
-        assert!(msg.contains("calculus"));
-        assert!(msg.contains("No hallucination"));
-    }
-
-    #[test]
-    fn test_extract_relevant_snippets() {
+    fn test_rank_for_context_sorts_highest_score_first() {
         let tiles = vec![
-            tile("t1", "Q", "Answer one", "math", 0.9),
-            tile("t2", "Q", "Answer two", "physics", 0.8),
-            tile("t3", "Q", "Answer three", "chem", 0.7),
+            make_tile("the cat sat on the mat", "feline resting", "bio", 0.5),
+            make_tile("dogs run fast", "canine speed", "bio", 0.5),
+            make_tile("the cat is a mammal", "mammal facts", "bio", 0.5),
         ];
-        let snippets = extract_relevant_snippets(&tiles, 2);
-        assert_eq!(snippets.len(), 2);
-        assert!(snippets[0].contains("Answer one"));
+        let ranked = rank_for_context(&tiles, "cat mammal");
+        // "the cat is a mammal" should score highest (both 'cat' and 'mammal' present)
+        assert!(
+            ranked[0].0 > ranked[1].0 || ranked[0].1.question.contains("mammal"),
+            "highest ranked tile should have best keyword overlap"
+        );
+        // Scores should be non-increasing
+        for window in ranked.windows(2) {
+            assert!(
+                window[0].0 >= window[1].0,
+                "scores not sorted descending: {} < {}",
+                window[0].0,
+                window[1].0
+            );
+        }
     }
 
     #[test]
-    fn test_truncate_to_tokens() {
-        let long = "a".repeat(1000);
-        let truncated = truncate_to_tokens(&long, 10);
-        assert!(truncated.len() < 1000);
-        assert!(truncated.ends_with("..."));
+    fn test_rank_for_context_empty_query_returns_all_tiles() {
+        let tiles = vec![
+            make_tile("Q1", "A1", "d", 0.9),
+            make_tile("Q2", "A2", "d", 0.5),
+        ];
+        let ranked = rank_for_context(&tiles, "");
+        assert_eq!(ranked.len(), tiles.len(), "should return all tiles");
+        for (score, _) in &ranked {
+            assert_eq!(*score, 0.0, "all scores should be 0.0 for empty query");
+        }
+        // Original order preserved
+        assert_eq!(ranked[0].1.question, "Q1");
+        assert_eq!(ranked[1].1.question, "Q2");
+    }
+
+    // --- inject_deadband ---
+
+    #[test]
+    fn test_inject_deadband_passes_through_if_check_passed() {
+        let check = DeadbandContext {
+            passed: true,
+            violations: vec!["some violation".to_string()],
+            recommended_channel: None,
+        };
+        let original = "My prompt here.";
+        let result = inject_deadband(original, &check);
+        assert_eq!(result, original, "passed check should not modify prompt");
     }
 
     #[test]
-    fn test_truncate_no_truncate() {
-        let short = "hello world";
-        assert_eq!(truncate_to_tokens(short, 100), "hello world");
+    fn test_inject_deadband_prepends_safety_block_when_violations() {
+        let check = DeadbandContext {
+            passed: false,
+            violations: vec!["overheating".to_string(), "out of bounds".to_string()],
+            recommended_channel: Some("emergency".to_string()),
+        };
+        let result = inject_deadband("Do something.", &check);
+        assert!(result.starts_with("[SAFETY]"), "should start with [SAFETY]");
+        assert!(result.contains("overheating"), "should include first violation");
+        assert!(result.contains("out of bounds"), "should include second violation");
+        assert!(result.contains("Do something."), "original prompt should be preserved");
+    }
+
+    // --- build_system_message ---
+
+    #[test]
+    fn test_build_system_message_formats_correctly() {
+        let msg = build_system_message("OracleBot", &["search", "summarize", "rank"]);
+        assert_eq!(
+            msg,
+            "You are OracleBot. Capabilities: search, summarize, rank."
+        );
     }
 
     #[test]
-    fn test_build_prompt_zero_budget() {
-        let tiles = vec![tile("t1", "Q", "A", "m", 0.9)];
-        let prompt = build_prompt("q", &tiles, 0);
-        // Should still work, just no context
-        assert!(prompt.context.is_empty());
+    fn test_build_system_message_with_empty_capabilities() {
+        let msg = build_system_message("BasicBot", &[]);
+        assert_eq!(msg, "You are BasicBot. Capabilities: .");
     }
 }
